@@ -950,7 +950,7 @@ interesting_genes <- data.frame(read.csv("genes_underexp.tsv", sep = "\t", heade
 
 # Then, this loop will make and save the plots for all the genes in the table
 for (i in 1:nrow(interesting_genes)) {
-  ggsave(paste0("By_Gene/Underexp/", interesting_genes[i, 2], ".jpg"),
+  ggsave(paste0(toString(interesting_genes[i, 2]), ".jpg"), path = "By_Gene_Bp/",
          width = 16, height = 10, dpi = 300,
          plotBoxScatter_DR(toString(interesting_genes[i, 1]),
                            toString(interesting_genes[i, 2]),
