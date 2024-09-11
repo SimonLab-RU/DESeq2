@@ -1,0 +1,1144 @@
+---
+title: "Guide for the Differential Expression Analysis of RNAseq data using DESeq2"
+author: "David Requena & Daniel Guevara"
+date: "2024-06-20"
+output: html_document
+---
+
+# 1. Set up
+## Call required libraries
+```{r, message = FALSE}
+library("PADOG", quietly = T)
+library("knitr", quietly = T)
+library("tidyr", quietly = T)
+library("dplyr", quietly = T)
+library("openxlsx", quietly = T)
+library("tximport", quietly = T)
+library("ensembldb", quietly = T)
+library("GenomicFeatures", quietly = T)
+library("RColorBrewer", quietly = T)
+library("gplots", quietly = T)
+library("ggplot2", quietly = T)
+library("ggrepel", quietly = T)
+library("tsne", quietly = T)
+library("umap", quietly = T)
+library("MatrixGenerics", quietly = T)
+library("DESeq2", quietly = T)
+library("BatchJobs", quietly = T)
+library("BiocParallel", quietly = T)
+library("biomaRt", quietly = T)
+library("pheatmap", quietly = T)
+library("randomcoloR", quietly = T)
+library("plotly", quietly = T)
+library("svglite", quietly = T)
+library("VennDiagram", quietly = T)
+library("DRnaSeq", quietly = T)
+library("pheatmap", quietly = T)
+library("ggsignif", quietly = T)
+library("gridExtra", quietly = T)
+library("cowplot", quietly = T)
+library("gtable", quietly = T)
+library("beeswarm", quietly = T)
+library("ggbeeswarm", quietly = T)
+library("scales", quietly = T)
+library("clusterProfiler", quietly = T)
+library("org.Hs.eg.db", quietly = T)
+library("AnnotationDbi", quietly = T)
+library("DOSE", quietly = T)
+```
+
+## Set working directory
+```{r}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "./")
+sample_data <- "samples_data_new2.xlsx"
+counts_dir <- "./Counts_Salmon_Chagas"
+```
+
+
+# 2. Pre processing workflow
+## Sample metadata
+```{r}
+sampledata <- data.frame(read.xlsx(sample_data))
+sampledata$group <- factor(sampledata$group, ordered = T, levels = c("A/Tc-", "B/Tc-", "A/Tc+", "B/Tc+"))
+sampledata$chagas <- factor(sampledata$chagas)
+sampledata$gp <- factor(sampledata$gp)
+sampledata$cardiac <- factor(sampledata$cardiac)
+sampledata$sex <- factor(sampledata$sex)
+sampledata$age_cat <- factor(sampledata$age_cat)
+rownames(sampledata) <- sampledata$id
+sampledata$num <- 1:21
+```
+
+## Managing Salmon count files
+```{r}
+count_files <- file.path(counts_dir, paste0(sampledata$id, "_quant.sf"))
+names(count_files) <- sampledata$id
+
+txi <- tximport(count_files, type="salmon", txOut=TRUE, countsFromAbundance="no")
+counts.tx <- txi$counts
+counts.tx <- counts.tx[rowSums(counts.tx) > 0,]
+
+sampledata$tx_counts <- colSums(counts.tx)
+
+# Output
+write.xlsx(sampledata, file = "samples_with_counts.xlsx", colNames = T, rowNames = F, append = F)
+```
+
+### Counts per sample
+```{r}
+my_colors <- c("paleturquoise1", "lightpink", "#6691C7", "#E54155")
+
+p.counts <- ggplot(data = sampledata, aes(x = id, y = tx_counts, fill = group)) +
+  theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) +
+  geom_bar(stat="identity", color="black", linewidth = 0.3) + scale_fill_manual(values = my_colors) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, .01)), labels = scales::comma, breaks = seq(0,7e+7,by=0.5e+7)) +
+  xlab("Sample ID") + ylab("Counts") + theme(axis.title=element_text(size=16))
+
+p.counts
+
+ggsave("plots/Counts-Transcript_per_Sample.jpg", p.counts, width = 10, height = 8, dpi = 300)
+```
+
+## Transcripts into genes
+```{r}
+tx2gene <- data.frame(read.xlsx("tx2gene_GRCh38v103.xlsx"))
+txi.toGene <- summarizeToGene(txi, tx2gene[,c("transcriptID","geneID")])
+
+# Add gene counts
+counts.gene <- as.data.frame(txi.toGene$counts)
+counts.gene <- counts.gene[rowSums(counts.gene) > 0,]
+sampledata$gene_counts <- colSums(counts.gene)
+
+write.xlsx(sampledata, file = "Samples_with_Counts.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+
+# Load geneID annotations
+annotations <- c("symbol", "biotype", "chromosome", "gene_start", "gene_end", "gene_length", "description")
+geneID.details <- tx2gene[,c("geneID", annotations)]
+geneID.details <- geneID.details[!duplicated(geneID.details), ]
+
+################################################################################################################
+## Extra genes
+### Remove NAs
+for (i in 1:nrow(geneID.details)) {
+  if (is.na(geneID.details$symbol[i])) {
+    geneID.details$symbol[i] <- geneID.details$geneID[i]
+  }
+}
+
+### Special names
+ensg_vector <- c("ENSG00000215304", "ENSG00000261575", "ENSG00000267053", "ENSG00000267618", "ENSG00000285794",
+                 "ENSG00000249679", "ENSG00000268189", "ENSG00000285839", "ENSG00000261915", "ENSG00000229337",
+                 "ENSG00000273711", "ENSG00000234389", "ENSG00000267283")
+new_genename <- c("Lnc-GOLGA8K-1", "C17orf58P", "Lnc-ZNF146-1", "RAD51L3-RFFL", "SCAND1P",
+                  "CCDC110-As", "Lnc-CYP4F22-3", "KTI12-H", "NHR-DC", "Lnc-NFE2L2-1",
+                  "PTGR2-As", "Lnc-SLC9A4-1", "BTBD2-As")
+
+for (i in 1:length(ensg_vector)) {
+  geneID.details$symbol[geneID.details$geneID == ensg_vector[i]] <- new_genename[i]
+  
+  print(geneID.details$symbol[geneID.details$geneID == ensg_vector[i]])
+}
+
+### Checking
+sum(is.na(geneID.details$symbol))
+geneID.details$symbol[geneID.details$geneID == "ENSG00000268189"]
+################################################################################################################
+
+# Add annotations
+counts.gene_annotations <- counts.gene
+counts.gene_annotations$geneID <- rownames(counts.gene_annotations)
+counts.gene_annotations <- add_annotations(counts.gene_annotations, geneID.details, variables = annotations)
+
+write.xlsx(counts.gene_annotations, file = "Raw_Gene_Counts_Annotated.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+```
+
+## Filter out blacklists
+```{r}
+blacklist_nRibo <- data.frame(read.csv("blacklist_nuclear-ribo.tsv", sep = "\t", header = TRUE))
+blacklist_mtRibo <- data.frame(read.csv("blacklist_mito-ribo.tsv", sep = "\t", header = TRUE))
+blacklist_allRibo <- data.frame(read.csv("blacklist_all-ribo.tsv", sep = "\t", header = TRUE))
+
+# Keep the genes in each blacklist
+genecounts.nRibo <- counts.gene[rownames(counts.gene) %in% blacklist_nRibo[,1], ]
+genecounts.mtRibo <- counts.gene[rownames(counts.gene) %in% blacklist_mtRibo[,1], ]
+genecounts.filtered <- counts.gene[!(rownames(counts.gene) %in% blacklist_allRibo[,1]), ]
+
+sampledata$nRibo <- colSums(genecounts.nRibo)
+sampledata$mtRibo <- colSums(genecounts.mtRibo)
+sampledata$filtered <- colSums(genecounts.filtered)
+
+write.xlsx(sampledata, file = "samples_with_counts.xlsx", colNames = T, rowNames = F, append = F)
+
+# Filter the txi object
+keep <- !(rownames(txi.toGene$counts) %in% blacklist_allRibo[,1])
+
+txi.toGene$abundance <- txi.toGene$abundance[keep, ]
+txi.toGene$counts <- txi.toGene$counts[keep, ]
+txi.toGene$length <- txi.toGene$length[keep, ]
+```
+
+### Counts per blacklist
+```{r}
+for (bl in c("nRibo", "mtRibo")) {
+  p.sub <- ggplot(data = sampledata, aes_string(x = "id", y = bl, fill = "group")) +
+    theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) +
+    geom_bar(stat="identity", color="black", linewidth = 0.3) + scale_fill_manual(values = my_colors) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_y_continuous(expand = expansion(mult = c(0, .01)), labels = scales::comma) +
+    xlab("Sample ID") + ylab(bl) + theme(axis.title=element_text(size=16))
+  
+  print(p.sub)
+  
+  ggsave(paste0("plots/Counts-Transcript_per_Sample_", bl, ".jpg"),
+         p.sub, width = 10, height = 8, dpi = 300)
+}
+
+# Filtered
+p.filt <- ggplot(data = sampledata, aes(x = id, y = filtered, fill = group)) +
+  theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) +
+  geom_bar(stat="identity", color="black", linewidth = 0.3) +
+  scale_fill_manual(values = my_colors) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, .05)), labels = scales::comma, breaks = seq(0,7e+7,by=0.5e+7)) +
+  xlab("Sample ID") + ylab("Filtered") + theme(axis.title=element_text(size=16))
+
+p.filt
+
+ggsave("plots/Counts-Transcript_per_Sample_filtered.jpg", p.filt,
+       width = 10, height = 8, dpi = 300)
+```
+
+## Scaled TPMs
+```{r}
+# Calculate the TPM. The columns will now add 1 million.
+gene.tpm <- tpm(counts.gene, counts.gene_annotations$gene_length)
+gene.tpm <- data.frame(gene.tpm)
+
+#write.xlsx(sampledata, file = "Samples_with_Counts.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+
+gene.tpm.annotated <- add_annotations(gene.tpm, geneID.details, variables = annotations)
+
+write.xlsx(gene.tpm.annotated, file = "Gene_Counts_TPM.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+
+# Keep the genes in each blacklist
+geneTPM.nRibo <- gene.tpm[rownames(gene.tpm) %in% blacklist_nRibo[,1], ]
+geneTPM.mtRibo <- gene.tpm[rownames(gene.tpm) %in% blacklist_mtRibo[,1], ]
+geneTPM.allRibo <- gene.tpm[rownames(gene.tpm) %in% blacklist_allRibo[,1], ]
+
+sampledata$TPM_nRibo <- colSums(geneTPM.nRibo[1:(length(geneTPM.nRibo))])
+sampledata$TPM_mtRibo <- colSums(geneTPM.mtRibo[1:(length(geneTPM.nRibo))])
+sampledata$TPM_allRibo <- colSums(geneTPM.allRibo[1:(length(geneTPM.nRibo))])
+
+write.xlsx(sampledata, file = "Samples_with_Counts.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+```
+
+
+# 3. Differential Expression Analysis with DESeq2
+```{r}
+# Note: Salmon counts are going to be rounded
+ds.deseq <- DESeqDataSetFromTximport(txi.toGene, sampledata, ~gp+sex)
+colData(ds.deseq)$gp  <- factor(colData(ds.deseq)$gp,
+                                levels = c("An", "Bn", "Ap", "Bp"))
+
+# Note that read quantifications are rounded in DESeq, so Salmon counts < 0.5 are now 0
+nozero <- rowSums(counts(ds.deseq)) > 0
+ds.deseq <- ds.deseq[nozero, ] # Remove genes with zero counts
+ds.deseq <- estimateSizeFactors(ds.deseq)
+
+######################
+# Normalized gene counts
+normalized.counts <- as.data.frame(counts(ds.deseq, normalized = TRUE))
+
+An.ids <- sampledata$id[sampledata$gp == "An"]
+Bn.ids <- sampledata$id[sampledata$gp == "Bn"]
+Ap.ids <- sampledata$id[sampledata$gp == "Ap"]
+Bp.ids <- sampledata$id[sampledata$gp == "Bp"]
+
+normalized.counts$Mean.An <- rowMeans(normalized.counts[, An.ids])
+normalized.counts$Mean.Bn <- rowMeans(normalized.counts[, Bn.ids])
+normalized.counts$Mean.Ap <- rowMeans(normalized.counts[, Ap.ids])
+normalized.counts$Mean.Bp <- rowMeans(normalized.counts[, Bp.ids])
+
+# Adding gene name and description
+normalized.counts.annotated <- add_annotations(normalized.counts, geneID.details, variables = annotations)
+write.xlsx(normalized.counts.annotated, file = "Normalized_Gene_counts.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+######################
+
+# Variance Stabilizing Transformation
+transf.data <- varianceStabilizingTransformation(ds.deseq)
+```
+
+## Explore confounders
+### PCA
+```{r}
+pca12 <- nice_PCA(transf.data, PCs = c(1, 2), ntop =  nrow(assay(transf.data)),
+                  variables = c("group", "sex"),
+                  legend_names = c("Group", "Sex"),
+                  size = 9, alpha = 1, colors = c(my_colors), shapes = 21:22, # Add violet to colors when grouping by age
+                  legend_title = 10, legend_elements = 8, legend_pos = NULL,
+                  labels = c(var = "num", size = 3))#, name_tags = c(var = "num", size = 2, minlen = 2, box = 0.6))
+
+pca12
+
+ggsave("plots/dim_reduction/PCA12_sex.png", pca12, width = 7, height = 6, dpi = 600)
+ggsave("plots/dim_reduction/PCA12_sex.svg", pca12, width = 7, height = 5, dpi = 600)
+
+#ggsave("plots/dim_reduction/PCA12_age.png", pca12, width = 7, height = 6, dpi = 300)
+#ggsave("plots/dim_reduction/PCA12_age.svg", pca12, width = 7, height = 5, dpi = 600)
+```
+
+### tSNE
+```{r}
+iter <- 10000
+seed <- 0
+plex <- 3
+
+p.tsne <- nice_tSNE(object = transf.data, seed = seed, perplexity = plex,
+                    max_iterations = iter, returnData = FALSE,
+                    variables = c("group", "sex"), colors = my_colors,
+                    shapes = 21:22, size = 9, alpha = 1,
+                    legend_names = c("Group", "Sex"),
+                    legend_title = 10, legend_elements = 8, legend_pos = NULL,
+                    #name_tags = c(var = "id", size = 2, minlen = 2, box = 0.6),
+                    labels = c(var = "num", size = 3))
+p.tsne
+
+ggsave(paste0("plots/dim_reduction/tSNE_s", seed, "_p", plex, "_i", (iter/1000), "k_sex.png"),
+       p.tsne, width = 6, height = 5, dpi = 600)
+ggsave(paste0("plots/dim_reduction/tSNE_s", seed, "_p", plex, "_i", (iter/1000), "k_sex.svg"),
+       p.tsne, width = 6, height = 5, dpi = 600)
+
+#ggsave(paste0("plots/dim_reduction/tSNE_s", seed, "_p", plex, "_i", (iter/1000), "k_age.png"),
+#       p.tsne, width = 6, height = 5, dpi = 300)
+#ggsave(paste0("plots/dim_reduction/tSNE_s", seed, "_p", plex, "_i", (iter/1000), "k_age.svg"),
+#       p.tsne, width = 6, height = 5, dpi = 600)
+```
+
+### UMAP
+```{r}
+############
+# 3D UMAP
+############
+## setup
+umap.params = umap.defaults
+umap.params$n_neighbors=4
+umap.params$n_components=3
+umap.params$n_epochs=20000
+umap.params$random_state=1
+umap.params$transform_state=1
+umap.params$verbose=TRUE
+
+umap_data <- umap(t(assay(transf.data)), config = umap.params)
+
+### my_colors <- c("paleturquoise1", "khaki1", "lightpink")
+u_shapes <- c("circle", "square")
+u_font <- list(family = "arial", size = 10, color = toRGB("grey10"))
+u_strokes <- c("black", "red", "blue") # Color-blind safe
+
+df.umap <- data.frame(umap_data$layout) %>%
+  tibble::rownames_to_column("id") %>%
+  dplyr::inner_join(sampledata, by = "id")
+
+
+## 3D UMAP plot
+umap_plot <- plot_ly(data = df.umap, x = ~X1, y = ~X2, z = ~X3, 
+                     type="scatter3d", mode="markers",
+                     color = ~gp, colors = c(my_colors),
+                     marker = list(size = 10),
+                     stroke = I("black"),
+                     symbol = ~sex, symbols = u_shapes,
+                     size = I(750), strokes = u_strokes) %>%
+  add_text(text = ~num, textfont = u_font,
+           textposition = "center", showlegend = FALSE) %>%
+  layout(scene = list(xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      zaxis = list(title = 'UMAP 3')))
+
+htmlwidgets::saveWidget(umap_plot, paste0("plots/dim_reduction/Umap_n", umap.params$n_neighbors, "_",
+                                          umap.params$n_components, "D", ".html"))
+
+############
+# 2D UMAP
+############
+## ggplot
+umap_data <- umap(t(assay(transf.data)))
+
+# u_colors <- c("paleturquoise1", "khaki1", "wheat", "lightpink") # Color-blind safe
+### shapes = c(24, 23, 23, 23, 21, 21, 22, 21, 21, 21, 25)
+
+df.umap <- data.frame(umap_data$layout) %>%
+  tibble::rownames_to_column("id") %>%
+  dplyr::inner_join(sampledata, by = "id")
+
+p.umap <- ggplot(data = df.umap, aes(x = X1, y = X2, fill = group, shape = sex)) +
+  geom_point(size = 8, alpha = 0.9) + coord_fixed() +  theme_bw() +
+  scale_shape_manual(values = 21:22, guide = guide_legend(override.aes = list(size = 7), keyheight = 1.7)) +
+  scale_fill_manual(values = c(my_colors), guide = guide_legend(override.aes = aes(shape = 21, size = 7))) +
+  geom_text(aes(label = num), size = 3) + # + geom_text_repel(aes(label = df.umap$label), color = "black", cex = 3, min.segment.length = unit(2, "lines"), box.padding = unit(0.5, "lines")) +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), legend.position = "right",
+        legend.title = element_text(size=10), legend.text=element_text(size=8),
+        legend.background = element_rect(color = "black"), legend.box.just = "left") +
+  labs(fill = expression(underline("Group")), shape = expression(underline("Sex")))
+
+p.umap
+
+ggsave(paste0("plots/dim_reduction/Umap_n", umap_data$config$n_neighbors, "_",
+              umap_data$config$n_components, "D", ".png"),
+       p.umap, width = 6, height = 5.5, dpi = 600)
+ggsave(paste0("plots/dim_reduction/Umap_n", umap_data$config$n_neighbors, "_",
+              umap_data$config$n_components, "D", ".svg"),
+       p.umap, width = 6, height = 5.5, dpi = 600)
+```
+
+### Heatmap samples vs samples
+```{r}
+######################
+# Samples Heatmap
+######################
+sampleDists <- dist(t(assay(transf.data)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+# Sample IDs + complete phenotypes
+rownames(sampleDistMatrix) <- paste(transf.data$id, transf.data$group, sep = "_")
+colnames(sampleDistMatrix) <- paste(transf.data$id, transf.data$group, sep = "_")
+
+heatmap_samples <- pheatmap(sampleDistMatrix, clustering_method = "complete", angle_col = 90)
+
+ggsave("plots/dim_reduction/Heatmap_samples_v1.svg", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+ggsave("plots/dim_reduction/Heatmap_samples_v1.png", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+
+# Sample IDs + short phenotypes
+rownames(sampleDistMatrix) <- paste(transf.data$id, transf.data$gp, sep = "_")
+colnames(sampleDistMatrix) <- paste(transf.data$id, transf.data$gp, sep = "_")
+
+heatmap_samples <- pheatmap(sampleDistMatrix, clustering_method = "complete", angle_col = 90)
+
+ggsave("plots/dim_reduction/Heatmap_samples_v2.svg", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+ggsave("plots/dim_reduction/Heatmap_samples_v2.png", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+
+# Numbers + complete phenotypes
+rownames(sampleDistMatrix) <- paste(transf.data$num, transf.data$group, sep = "_")
+colnames(sampleDistMatrix) <- paste(transf.data$num, transf.data$group, sep = "_")
+
+heatmap_samples <- pheatmap(sampleDistMatrix, clustering_method = "complete", angle_col = 90)
+
+ggsave("plots/dim_reduction/Heatmap_samples_v3.svg", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+ggsave("plots/dim_reduction/Heatmap_samples_v3.png", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+
+# Numbers + short phenotypes
+rownames(sampleDistMatrix) <- paste(transf.data$num, transf.data$gp, sep = "_")
+colnames(sampleDistMatrix) <- paste(transf.data$num, transf.data$gp, sep = "_")
+
+heatmap_samples <- pheatmap(sampleDistMatrix, clustering_method = "complete", angle_col = 90)
+
+ggsave("plots/dim_reduction/Heatmap_samples_v4.svg", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+ggsave("plots/dim_reduction/Heatmap_samples_v4.png", plot = heatmap_samples,
+       width = 7, height = 7, dpi = 600)
+```
+
+## Obtain comparisons
+```{r}
+# Model matrix
+ds.deseq <- DESeq(ds.deseq, modelMatrixType="standard", betaPrior=FALSE)
+
+## DESeq2's dispersion estimates
+plotDispEsts(ds.deseq)
+
+# This will show the possible comparisons, according to the design provided
+resultsNames(ds.deseq)
+
+cutoff_alpha <- 0.25 # Cut off p-value
+cutoff_fold <- 1 # Cut off fold-change
+```
+
+
+# 3. Results
+```{r}
+# Get the results of group Ap vs An
+res.Ap_An <- results(ds.deseq, name = "gp_Ap_vs_An",
+                     altHypothesis="greaterAbs",
+                     alpha = cutoff_alpha,
+                     # independentFiltering = FALSE, # Automatic filtering
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Ap_An)
+head(res.Ap_An[(res.Ap_An$padj < cutoff_alpha) & !is.na(res.Ap_An$padj), ], n = 10)
+
+# Get the results of group Bp vs group An
+res.Bp_An <- results(ds.deseq, name = "gp_Bp_vs_An",
+                     altHypothesis="greaterAbs",
+                     alpha = cutoff_alpha,
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Bp_An)
+head(res.Bp_An[(res.Bp_An$padj < cutoff_alpha) & !is.na(res.Bp_An$padj), ], n = 10)
+
+# Get the results of group Bn vs An
+res.Bn_An <- results(ds.deseq, name = "gp_Bn_vs_An",
+                     altHypothesis = "greaterAbs",
+                     alpha = cutoff_alpha,
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Bn_An)
+head(res.Bn_An[(res.Bn_An$padj < cutoff_alpha) & !is.na(res.Bn_An$padj), ], n = 10)
+
+# Get the results of group Bp vs group Bn
+res.Bp_Bn <- results(ds.deseq, contrast=list("gp_Bp_vs_An", "gp_Bn_vs_An"),
+                     altHypothesis="greaterAbs",
+                     alpha = cutoff_alpha,
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Bp_Bn)
+head(res.Bp_Bn[(res.Bp_Bn$padj < cutoff_alpha) & !is.na(res.Bp_Bn$padj), ], n = 10)
+
+# Get the results of group Bp vs group Ap
+res.Bp_Ap <- results(ds.deseq, contrast=list("gp_Bp_vs_An", "gp_Ap_vs_An"),
+                     altHypothesis="greaterAbs",
+                     alpha = cutoff_alpha,
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Bp_Ap)
+head(res.Bp_Ap[(res.Bp_Ap$padj < cutoff_alpha) & !is.na(res.Bp_Ap$padj), ], n = 10)
+
+# Get the results of group Bn vs group Ap
+res.Bn_Ap <- results(ds.deseq, contrast=list("gp_Bn_vs_An", "gp_Ap_vs_An"),
+                     altHypothesis="greaterAbs",
+                     alpha = cutoff_alpha,
+                     pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+summary(res.Bn_Ap)
+head(res.Bn_Ap[(res.Bn_Ap$padj < cutoff_alpha) & !is.na(res.Bn_Ap$padj), ], n = 10)
+```
+
+## Annotate results
+```{r}
+add_annotations <- function(object, reference = geneID.details, variables = NULL){
+
+  #df <- as.data.frame(object)
+  df <- object
+  df$geneID <- rownames(df)
+  index <- match(df$geneID, geneID.details$geneID)
+
+  # Add a new column for each variable
+  for(i in 1:length(variables)){
+    df[,variables[i]] <- geneID.details[index, variables[i]]
+  }
+
+  return(df)
+}
+
+# Ap vs An
+res.Ap_An <- add_annotations(res.Ap_An, geneID.details, variables = annotations)
+colnames(res.Ap_An)[7] <- "ensembl"
+
+# Bn vs An
+res.Bn_An <- add_annotations(res.Bn_An, geneID.details, variables = annotations)
+colnames(res.Bn_An)[7] <- "ensembl"
+
+# Bp vs An
+res.Bp_An <- add_annotations(res.Bp_An, geneID.details, variables = annotations)
+colnames(res.Bp_An)[7] <- "ensembl"
+
+# Bp vs Ap
+res.Bp_Ap <- add_annotations(res.Bp_Ap, geneID.details, variables = annotations)
+colnames(res.Bp_Ap)[7] <- "ensembl"
+
+# Bp vs Bn
+res.Bp_Bn <- add_annotations(res.Bp_Bn, geneID.details, variables = annotations)
+colnames(res.Bp_Bn)[7] <- "ensembl"
+
+# Bn vs Ap
+res.Bn_Ap <- add_annotations(res.Bn_Ap, geneID.details, variables = annotations)
+colnames(res.Bn_Ap)[7] <- "ensembl"
+
+# Significance
+res.Ap_An.sig <- subset(res.Ap_An, ((padj < cutoff_alpha) & !is.na(padj)))
+res.Bp_An.sig <- subset(res.Bp_An, ((padj < cutoff_alpha) & !is.na(padj)))
+res.Bn_An.sig <- subset(res.Bn_An, ((padj < cutoff_alpha) & !is.na(padj)))
+res.Bp_Bn.sig <- subset(res.Bp_Bn, ((padj < cutoff_alpha) & !is.na(padj)))
+res.Bp_Ap.sig <- subset(res.Bp_Ap, ((padj < cutoff_alpha) & !is.na(padj)))
+res.Bn_Ap.sig <- subset(res.Bn_Ap, ((padj < cutoff_alpha) & !is.na(padj))) # TFO
+
+write.xlsx(res.Ap_An.sig, file = "res_Ap_An_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+write.xlsx(res.Bp_An.sig, file = "res_Bp_An_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+write.xlsx(res.Bn_An.sig, file = "res_Bn_An_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+write.xlsx(res.Bp_Bn.sig, file = "res_Bp_Bn_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+write.xlsx(res.Bp_Ap.sig, file = "res_Bp_Ap_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T)
+write.xlsx(res.Bn_Ap.sig, file = "res_Bn_Ap_padj<0.25.xlsx", colNames = T, rowNames = F, append = F, overwrite = T) # TFO
+```
+
+## Exploring DEGs
+```{r}
+# Definte sets
+sets_dys <- list("A/Tc+ vs A/Tc-" = res.Ap_An.sig$ensembl,
+                 "B/Tc- vs A/Tc-" = res.Bn_An.sig$ensembl,
+                 "B/Tc+ vs A/Tc-" = res.Bp_An.sig$ensembl,
+                 "B/Tc+ vs B/Tc-" = res.Bp_Bn.sig$ensembl,
+                 "B/Tc+ vs A/Tc+" = res.Bp_Ap.sig$ensembl)
+
+# Create the Venn diagram for the five sets
+venn.diagram(sets_dys, filename = "plots/venn_dysregulated.png",
+             main.fontface = "bold", main.pos = c(0.5, 0.95),
+             fill = c("paleturquoise1", "khaki1", "thistle", "violet", "lightpink"), alpha = 0.5,
+             cat.pos = c(0, -30, 180, 180, 360), cat.dist = c(0.2, 0.2, 0.15, 0.2, 0.2),
+             height = 1000, width = 1000, resolution = 150,
+             imagetype = "png", units = "px")
+
+```
+
+## Detectability
+```{r}
+# Detectable differentially expressed genes
+detect_list <- detect_filter(norm.counts = normalized.counts[, 1:21],
+                             df.BvsA = res.Ap_An.sig,
+                             df.CvsA = res.Bn_An.sig,
+                             df.DvsA = res.Bp_An.sig,
+                             cutoffs = c(50, 50, 0),
+                             samples.baseline = 1:3,
+                             samples.condition1 = 4:6,
+                             samples.condition2 = 7:9,
+                             samples.condition3 = 10:21)
+detect_list$DetectGenes
+```
+
+## Split cases
+```{r}
+# Exclusive cases
+DEGs_sig <- split_cases(df.BvsA = res.Ap_An,
+                        df.CvsA = res.Bp_An,
+                        df.BvsC = res.Bp_Ap,
+                        unique_id = "ensembl",
+                        significance_var = "padj",
+                        significance_cutoff = 0.25,
+                        change_var = "log2FoldChange",
+                        change_cutoff = 0)
+
+for (i in names(DEGs_sig)) {
+  DEGs_sig[[i]] <- DEGs_sig[[i]][rownames(DEGs_sig[[i]]) %in% detect_list$DetectGenes, ]
+  DEGs_sig[[i]] <- DEGs_sig[[i]][DEGs_sig[[i]]$padj < 0.05, ]
+}
+```
+
+## Filter results data frames
+```{r}
+DEGs_sig$Case4[, c("ensembl", "symbol", "trend")]
+DEGs_sig$Case5[, c("ensembl", "symbol", "trend")]
+DEGs_sig$Case6[, c("ensembl", "symbol", "trend")]
+DEGs_sig$Case8[, c("ensembl", "symbol", "trend")]
+DEGs_sig$Case9[, c("ensembl", "symbol", "trend")]
+
+# Create detectable data frames
+res.Bp_Ap.det <- res.Bp_Ap.sig[rownames(res.Bp_Ap.sig) %in% detect_list$DetectGenes, ]
+res.Bp_An.det <- res.Bp_An.sig[rownames(res.Bp_An.sig) %in% detect_list$DetectGenes, ]
+res.Ap_An.det <- res.Ap_An.sig[rownames(res.Ap_An.sig) %in% detect_list$DetectGenes, ]
+res.Bp_Bn.det <- res.Bp_Bn.sig[rownames(res.Bp_Bn.sig) %in% detect_list$DetectGenes, ] # To filter out
+res.Bn_An.det <- res.Bn_An.sig[rownames(res.Bn_An.sig) %in% detect_list$DetectGenes, ] # To filter out
+```
+
+
+# 4. Plotting
+##  BSV plots
+```{r}
+################
+# Significance #
+################
+
+get_stars <- function(geneID, object, thresholds = c(0.001, 0.01, 0.1, 0.25)) {
+	
+  # Ensure the geneID column is of the correct type of matching
+	object <- as.data.frame(object)
+	object$ensembl <- as.character(object$ensembl)
+
+	# Find the row with the marching geneID and get de padj value
+	padj <- object$padj[object$ensembl == geneID]
+
+	# Check if gene ID was found
+	if (length(padj) == 0) {
+		return("Gene ID not found")
+	}
+
+	# Order thresholds vector increasingly
+	thresholds <- sort(thresholds, decreasing = FALSE)
+
+	# Retrieve stars
+	if (is.na(padj) || padj > thresholds[4]) {
+		stars <- "ns" # Not significant
+	} else if (padj <= thresholds[1]) {
+		stars <- "****"
+	} else if (padj <= thresholds[2]) {
+		stars <- "***"
+	} else if (padj <= thresholds[3]) {
+		stars <- "**"
+	} else {
+		stars <- "*"
+	}
+
+	return(stars)
+}
+
+
+for (i in 1:length(res.Bp_Ap.det[, "ensembl"])) {
+    
+    # Extracting the vector of counts for that gene
+    gene_counts <- counts(ds.deseq, normalized = TRUE)[res.Bp_Ap.det[i, "ensembl"], ]
+    log2_gc <- log2(gene_counts)
+    
+    # Making a dataframe for the plot
+    df.box <- data.frame(ds.deseq@colData[, c("id", "group", "sex",
+                                              "age", "age_cat", "num")], log2_gc)
+    
+    # Re-ordering sample_type for the plot
+    df.box$group <- factor(df.box$group,
+                           levels = c("A/Tc-", "A/Tc+", "B/Tc-", "B/Tc+"),
+                           labels = c("A/Tc-", "A/Tc+", "B/Tc-", "B/Tc+"))
+    
+    # Plot
+    p.bs <- ggplot(df.box, aes(x = group, y = log2_gc)) + theme_bw() +
+      
+      # Violin plot
+      geom_violin(alpha = 0.1, scale = "width", fill = "yellow", colour = "peru",#aes(fill = gp), color = "transparent",
+                  show.legend = FALSE, trim = TRUE) +
+      
+      # Scatter plot
+      geom_point(data = df.box, aes(fill = sex), shape = 21,
+                 size = 5, alpha = 1, position = position_jitter(width = 0.15)) +
+      
+      # Box plot with error bar
+      geom_boxplot(width = 0.1, fill = "gray90") +
+      geom_errorbar(stat = "boxplot", width = 0.4, linewidth = 1, color = "black",
+                    aes(ymin = after_stat(middle), ymax = after_stat(middle))) +
+      
+      # Axis labels
+      labs(x = NULL, y = expression("log"[2]*"(Norm. Counts)"), title = paste0(res.Bp_Ap.det[i, "symbol"])) +
+      
+      # Axis text size
+      theme(axis.text.x = element_text(size = 24),#angle = 70, vjust = 1, hjust = 1)
+            axis.text.y = element_text(size = 16),
+            axis.title.y = element_text(size = 22),
+            title = element_text(size = 26)) +
+      
+      # Legend setting
+      ##scale_color_manual(name = "Sex", values = c("red", "blue"),
+      ##                   guide = guide_legend(override.aes = aes(size = 7))) +
+      scale_fill_manual(name = "Sex", values = c("M" = "#619CFF", "F" = "#F8766D"),
+                        #"An" = "paleturquoise1",
+                        #"Ap" = "khaki1",
+                        #"Bp" = "lightpink"),
+                        #guide = "none") + #,
+                        guide = guide_legend(override.aes = aes(shape = 21, size = 7))) +
+      
+      # Legend size
+      theme(legend.title = element_text(size= 14), legend.text=element_text(size = 13),
+            panel.grid.major = element_line(colour = "gray80", linetype = "dashed", linewidth = 0.25),
+            panel.grid.minor = element_line(colour = "gray80", linetype = "dashed", linewidth = 0.25))
+    
+    
+    # Set max and min values without considering +/- Inf values
+    min_value <- min(df.box$log2_gc[is.finite(df.box$log2_gc)])
+    max_value <- max(df.box$log2_gc[is.finite(df.box$log2_gc)])
+    
+    # Generating y position for the significance bars
+    ## Objective: maintain same proportion in distance for each plot
+    y_range <- diff(range(df.box$log2_gc[is.finite(df.box$log2_gc)]))
+    prop <- 0.08*y_range
+    
+    # Creating signif data for all genes
+    sig_data <- data.frame(gene = rep(res.Bp_Ap.det[i, "symbol"], 3),
+                           group1 = c("A/Tc-",
+                                      "A/Tc+",
+                                      #"A/Tc-",
+                                      #"B/Tc-",
+                                      "A/Tc-"),
+                           group2 = c("A/Tc+",
+                                      "B/Tc+",
+                                      #"B/Tc-",
+                                      #"B/Tc+",
+                                      "B/Tc+"),
+                           ypos = c(max_value + prop, max_value + prop,
+                                    #max_value + prop*2.2, max_value + prop*2.2,
+                                    max_value + prop*2.2),
+                           label = c(get_stars(res.Bp_Ap.det[i, "ensembl"], res.Ap_An),
+                                     get_stars(res.Bp_Ap.det[i, "ensembl"], res.Bp_Ap),
+                                     #get_stars(res.Bp_Ap.det[i, "ensembl"], res.Bn_An),
+                                     #get_stars(res.Bp_Ap.det[i, "ensembl"], res.Bp_Bn),
+                                     get_stars(res.Bp_Ap.det[i, "ensembl"], res.Bp_An)))
+    
+    # Ticks by same unit
+    p.bs <- p.bs + scale_y_continuous(breaks = seq(floor(min_value), ceiling(max_value), by = 1))
+    p.bs <- p.bs + geom_signif(data = sig_data, manual = TRUE, size = 2, colour = "grey5",
+                               aes(xmin = group1, xmax = group2, annotations = label, y_position = ypos),
+                               textsize = 6.5, vjust = 0, tip_length = 0.015)
+    
+    print(p.bs)
+    
+    ggsave(filename = paste0("plots/BSV/Bp_Ap/",
+                             res.Bp_Ap.det[i, "symbol"], ".jpg"), width = 7, height = 7.5, dpi = 300)
+
+}
+```
+
+## Volcano plots
+```{r}
+# Parameters
+## padj and FC tresholds
+ctf_nice <- 0.01
+fld_nice <- cutoff_fold * 4
+
+# With ggplot
+############
+## Ap vs An
+############
+d.volcano <- data.frame(res.Bp_Bn)
+d.volcano <- d.volcano[!is.na(d.volcano$padj), ]
+d.volcano$log2FoldChange[d.volcano$log2FoldChange > 8] <- 8
+d.volcano$log2FoldChange[d.volcano$log2FoldChange < -8] <- -8
+d.volcano$padj[d.volcano$padj < 10**-3] <- 10**-3
+d.volcano$padj[d.volcano$padj > 10**8] <- 10**8
+
+# d.volcano$symbol[is.na(d.volcano$symbol) | (d.volcano$symbol == "")] <- "NS"
+
+d.volcano$colors <- rep("other", nrow(d.volcano))
+d.volcano$colors[(d.volcano$log2FoldChange >= cutoff_fold & d.volcano$padj < cutoff_alpha)] <- "over"
+d.volcano$colors[(d.volcano$log2FoldChange <= -cutoff_fold & d.volcano$padj < cutoff_alpha)] <- "under"
+
+d.volcano$shapes <- rep("nohits", nrow(d.volcano))
+d.volcano$shapes[(abs(d.volcano$log2FoldChange) >= fld_nice & d.volcano$padj == 10**-3)] <- "hits"
+
+cond1 <- !( (abs(d.volcano$log2FoldChange) <= cutoff_fold) | (d.volcano$padj > cutoff_alpha) )
+cond2 <- !( (abs(d.volcano$log2FoldChange) <= fld_nice) | (d.volcano$padj > ctf_nice) )
+cond3 <- d.volcano$ensembl %in% detect_list$DetectGenes & d.volcano$padj < 0.1 & abs(d.volcano$log2FoldChange) > 1
+cond <- cond3 | (cond1 & cond2)
+
+
+p.volcano <- ggplot() + theme_bw() +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 3.07),
+                     breaks = seq(1, 5, by = 1),
+                     minor_breaks = seq(0, 5, by = 1)) +
+  scale_x_continuous(expand = c(0,0),
+                     limits = c(-9.5, 9.5),
+                     breaks = seq(-9, 9, by = 3),
+                     minor_breaks = seq(-9, 9, by = 1)) +
+  
+  # Vertical lines and labels:
+  geom_vline(xintercept = c(-cutoff_fold, cutoff_fold), color = "red2", alpha = 0.8, linetype = 2, linewidth = 1.2) +
+  geom_text(aes(x = -cutoff_fold - 1.3, y = 2.75, label = paste("x =", -cutoff_fold)), color = "red2", size = 6.2) +
+  geom_text(aes(x = cutoff_fold + 1.3, y = 2.75, label = paste("x =", cutoff_fold)), color = "red2", size = 6.2) +
+  
+  # Horizontal line and label:
+  geom_hline(yintercept = -log10(cutoff_alpha), color = "red2", alpha = 0.8, linetype = 2, linewidth = 1.2) +
+  geom_text(aes(x = -7.35, y = -log10(cutoff_alpha) + 0.15, label = paste("q =", cutoff_alpha)), color = "red2", size = 6.2) +
+  
+  # Datapoints, in different colors:
+  geom_point(data = d.volcano,
+             aes(x = log2FoldChange, y = -log10(padj), fill = colors, shape = shapes),
+             size = 5.5, color = "gray10", alpha = 0.8, show.legend = TRUE) +
+  
+  # Color setting
+  ## "over" = "coral", "under" = "deepskyblue"
+  scale_fill_manual(name = "Expression",
+                    values = c("red", "grey50", "blue"),
+                    guide = guide_legend(override.aes = aes(shape = 21, size = 5)),
+                    breaks = c("over", "other", "under"),
+                    labels = c("Up-regulated", "Not changed", "Down-regulated")) +
+  
+  # Change outliers shapes
+  scale_shape_manual(values = c("hits" = 24, "nohits" = 21),
+                     guide = "none") +
+  
+  # Labels for the datapoints selected:
+  #geom_text_repel(aes(x = d.volcano$log2FoldChange[cond1 & cond2 & !cond3],
+  #                    y = -log10(d.volcano$padj[cond1 & cond2 & !cond3]),
+  #                    label = d.volcano$symbol[cond1 & cond2 & !cond3]),
+  #                inherit.aes = FALSE, parse = FALSE, max.iter = 5000, color = "black", cex = 4.3,
+  #                nudge_x = 0.2, nudge_y = -0.15, segment.alpha = 0,
+  #                box.padding = unit(0.1, "lines"), min.segment.length = unit(0.01, "lines")) +
+  
+  # Labels for detectable genes
+  geom_label_repel(aes(x = d.volcano$log2FoldChange[(d.volcano$log2FoldChange > 0) & cond3],
+                       y = -log10(d.volcano$padj[(d.volcano$log2FoldChange > 0) & cond3]),
+                       label = d.volcano$symbol[(d.volcano$log2FoldChange > 0) & cond3]),
+                   inherit.aes = FALSE, parse = FALSE, max.iter = 5000, color = "black", cex = 8.2,
+                   nudge_x = 0.2, nudge_y = -0.15, segment.alpha = 1,
+                   box.padding = unit(0.8, "lines"), min.segment.length = unit(0.01, "lines")) +
+  
+  geom_label_repel(aes(x = d.volcano$log2FoldChange[(d.volcano$log2FoldChange < 0) & cond3],
+                       y = -log10(d.volcano$padj[(d.volcano$log2FoldChange < 0) & cond3]),
+                       label = d.volcano$symbol[(d.volcano$log2FoldChange < 0) & cond3]),
+                   inherit.aes = FALSE, parse = FALSE, max.iter = 5000, color = "black", cex = 8.2,
+                   nudge_x = -0.2, nudge_y = -0.15, segment.alpha = 1,
+                   box.padding = unit(0.8, "lines"), min.segment.length = unit(0.01, "lines")) +
+  
+  # Axis labels:
+  labs(x = expression("log"[2]*"(Fold Change)"),
+       y = expression("-log"[10]*"FDR"),
+       title = "B/Tc+ over B/Tc-") +
+  
+  # Labels size
+  theme(plot.title = element_text(size = 26, face = "bold", hjust = 0.5),
+        axis.text = element_text(size = 22),
+        axis.title = element_text(size = 26),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size= 16))
+
+# p.volcano <- p.volcano + theme(element_text(20))
+p.volcano <- p.volcano + theme(legend.position = "none")
+p.volcano
+
+ggsave("plots/Bp_Ap_VolcanoPlot.jpg", p.volcano, width = 8, height = 8, dpi = 300)
+ggsave("plots/Bp_Ap_VolcanoPlot.svg", p.volcano, width = 8, height = 8, dpi = 300)
+
+ggsave("plots/Bp_An_VolcanoPlot.jpg", p.volcano, width = 8, height = 8, dpi = 300)
+ggsave("plots/Bp_An_VolcanoPlot.svg", p.volcano, width = 8, height = 8, dpi = 300)
+
+ggsave("plots/Ap_An_VolcanoPlot.jpg", p.volcano, width = 8, height = 8, dpi = 300)
+ggsave("plots/Ap_An_VolcanoPlot.svg", p.volcano, width = 8, height = 8, dpi = 300)
+
+ggsave("plots/Bn_An_VolcanoPlot.jpg", p.volcano, width = 8, height = 8, dpi = 300)
+ggsave("plots/Bn_An_VolcanoPlot.svg", p.volcano, width = 8, height = 8, dpi = 300)
+
+ggsave("plots/Bp_Bn_VolcanoPlot.jpg", p.volcano, width = 8, height = 8, dpi = 300)
+ggsave("plots/Bp_Bn_VolcanoPlot.svg", p.volcano, width = 8, height = 8, dpi = 300)
+```
+
+## Heatmap samples vs genes
+```{r}
+varst.data <- getVarianceStabilizedData(ds.deseq)
+
+colors_samples = list(Group = c("A/Tc-" = "aquamarine2",
+                                "B/Tc-" = "lightpink",
+                                "A/Tc+" = "#6691C7",
+                                "B/Tc+" = "#E54155"))
+
+## Ap vs An
+genescardio <- read.xlsx("res_Bp_Bn_padj<0.25.xlsx")
+
+genescardio <- rbind(detect_list$Comparison1[detect_list$Comparison1$padj < 0.1, c("ensembl", "symbol")],
+                     detect_list$Comparison2[detect_list$Comparison2$padj < 0.1, c("ensembl", "symbol")],
+                     detect_list$Comparison3[detect_list$Comparison3$padj < 0.1, c("ensembl", "symbol")])
+genescardio <- unique(genescardio)
+
+varst.data.sig <- varst.data[rownames(varst.data) %in% genescardio$ensembl, ]
+rownames(varst.data.sig) <- genescardio$symbol
+anot <- data.frame(sampledata$group, row.names = colnames(varst.data.sig))
+colnames(anot) <- c("Group")
+anot$Group <- factor(anot$Group)
+anot <- anot[order(anot$Group, decreasing = FALSE),, drop = FALSE ]
+varst.data.sig <- varst.data.sig[, rownames(anot)]
+
+rownames(anot) <- match(colnames(varst.data.sig), sampledata$id)
+colnames(varst.data.sig) <- match(colnames(varst.data.sig), sampledata$id)
+
+heatmap_Ap_An <- pheatmap(varst.data.sig, cluster_cols = FALSE, cluster_rows = TRUE, show_rownames = TRUE,
+                          clustering_method = "mcquitty", cellwidth = 9, cellheight = 9, treeheight_col = 50,
+                          treeheight_row = 50, scale = "row", annotation = anot, angle_col = 90,
+                          annotation_colors = colors_samples, kmeans_k = NA, dpi = 100, drop_levels = FALSE,
+                          cutree_rows = 2, gaps_col =  c(3, 6, 9))
+
+ggsave("plots/HeatMap_samples_detect_(padj_0.1)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_detect_(padj_0.1)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 300, units = "in")
+
+ggsave("plots/HeatMap_samples_Ap_An_(padj_0.25)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 11, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_Ap_An_(padj_0.25)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 11, dpi = 300, units = "in")
+
+ggsave("plots/HeatMap_samples_Bp_An_(padj_0.25)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 11, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_Bp_An_(padj_0.25)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 11, dpi = 300, units = "in")
+
+ggsave("plots/HeatMap_samples_Bp_Ap_(padj_0.25)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_Bp_Ap_(padj_0.25)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 300, units = "in")
+
+ggsave("plots/HeatMap_samples_Bn_An_(padj_0.25)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 7, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_Bn_An_(padj_0.25)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 7, dpi = 300, units = "in")
+
+ggsave("plots/HeatMap_samples_Bp_Bn_(padj_0.25)_WPGMA.svg",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 600, units = "in")
+ggsave("plots/HeatMap_samples_Bp_Bn_(padj_0.25)_WPGMA.png",
+       plot = heatmap_Ap_An, width = 6.2, height = 5, dpi = 300, units = "in")
+```
+
+
+# 5. Pathway Enrichment Analysis
+## ORA with clusterProfiler
+```{r}
+
+```
+
+## GSE with clusterProfiler
+```{r}
+############
+# Ap vs An #
+############
+ranked.Ap_An <- res.Ap_An[order(res.Ap_An$stat, decreasing = TRUE), ]
+ranked.Ap_An <- ranked.Ap_An[!is.na(ranked.Ap_An$stat), ]
+ranked.list.Ap_An <- ranked.Ap_An$stat
+names(ranked.list.Ap_An) <- ranked.Ap_An$ensembl
+
+# BP
+gseBP.Ap_An <- gseGO(geneList = ranked.list.Ap_An,
+                     ont = "BP",
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENSEMBL",
+                     eps = 1e-300,
+                     verbose = TRUE)
+
+gseBP.Ap_An.df <- as.data.frame(gseBP.Ap_An)
+View(gseBP.Ap_An.df)
+
+gseaplot(x = gseBP.Ap_An, geneSetID = 4)
+dotplot(gseBP.Ap_An)
+
+# CC
+gseCC.Ap_An <- gseGO(geneList = ranked.list.Ap_An,
+                     ont = "CC",
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENSEMBL",
+                     eps = 1e-300,
+                     verbose = TRUE)
+
+gseCC.Ap_An.df <- as.data.frame(gseCC.Ap_An)
+View(gseCC.Ap_An.df)
+
+gseaplot(x = gseCC.Ap_An, geneSetID = 1)
+dotplot(gseCC.Ap_An)
+
+# MF
+
+
+############
+# Bp vs An #
+############
+
+
+
+############
+# Bp vs Ap #
+############
+ranked.Bp_Ap <- res.Bp_Ap[order(res.Bp_Ap$stat, decreasing = TRUE), ]
+ranked.Bp_Ap <- ranked.Bp_Ap[!is.na(ranked.Bp_Ap$stat), ]
+ranked.list.Bp_Ap <- ranked.Bp_Ap$stat
+names(ranked.list.Bp_Ap) <- ranked.Bp_Ap$ensembl
+
+# BP
+gseBP.Bp_Ap <- gseGO(geneList = ranked.list.Bp_Ap,
+                     ont = "BP",
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENSEMBL",
+                     eps = 1e-300,
+                     verbose = TRUE)
+
+gseBP.Bp_Ap.df <- as.data.frame(gseBP.Bp_Ap)
+View(gseBP.Bp_Ap.df)
+
+gseaplot(x = gseBP.Bp_Ap, geneSetID = 1)
+dotplot(gseBP.Bp_Ap)
+
+# CC
+gseCC.Bp_Ap <- gseGO(geneList = ranked.list.Bp_Ap,
+                     ont = "CC",
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENSEMBL",
+                     eps = 1e-300,
+                     verbose = TRUE)
+
+gseCC.Bp_Ap.df <- as.data.frame(gseCC.Bp_Ap)
+View(gseCC.Bp_Ap.df)
+
+gseaplot(x = gseCC.Bp_Ap, geneSetID = 1)
+dotplot(gseCC.Bp_Ap)
+
+# MF
+gseMF.Bp_Ap <- gseGO(geneList = ranked.list.Bp_Ap,
+                     ont = "MF",
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENSEMBL",
+                     eps = 1e-300,
+                     verbose = TRUE)
+
+gseMF.Bp_Ap.df <- as.data.frame(gseMF.Bp_Ap)
+View(gseMF.Bp_Ap.df)
+
+gseaplot(x = gseMF.Bp_Ap, geneSetID = 1)
+dotplot(gseMF.Bp_Ap)
+```
+
+## GSEA with Broad Institute's CLI
+### Prepare inputs
+```{r}
+# Expression data
+expression_data_CCC <- normalized.counts.annotated
+expression_data_CCC <- expression_data_CCC[, c(26, 33, 1:21)]
+colnames(expression_data_CCC)[1:2] <- c("NAME", "DESCRIPTION")
+expression_data_CCC$DESCRIPTION <- rep(NA, nrow(expression_data_CCC))
+
+# Write to a tab-separated file
+write.table(expression_data_CCC, file = "GSEA/expression_data_CCC.txt",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Phenotype info
+## Number of classes
+n_classes <- length(levels(sampledata$gp))
+
+## Create .cls file content
+cls_header <- paste(nrow(sampledata), n_classes, "1")
+cls_classes <- paste0("# ", "An Bn Ap Bp")
+cls_labels <- paste(sampledata$gp, collapse = " ")
+
+cls_content <- paste(cls_header, cls_classes, cls_labels, sep = "\n")
+
+## Write to .cls file
+write(cls_content, file = "GSEA/phenotype_CCC.cls")
+```
+
+### Manage results
+```{r}
+# -------- #
+#  C2_CGP  #
+# -------- #
+
+
+
+# ---- #
+#  C7  #
+# ---- #
+
+C7.Ap_An <- as.data.frame(read.csv("GSEA/C7/C7_Ap_An_merged.tsv", sep = "\t", header = T))
+C7.Bp_An <- as.data.frame(read.csv("GSEA/C7/C7_Bp_An_merged.tsv", sep = "\t", header = T))
+C7.Bp_Ap <- as.data.frame(read.csv("GSEA/C7/C7_Bp_Ap_merged.tsv", sep = "\t", header = T))
+
+C7_cases <- split_cases(data1 = C7.Ap_An, data2 = C7.Bp_An, data3 = C7.Bp_Ap, unique_id = "NAME",
+                        significance_var = "FDR.q.val", significance_cutoff = 0.05,
+                        change_var = "NES", change_cutoff = 0)
+
+remove(C7_cases, C7.Bp_Ap, C7.Bp_An, C7.Ap_An)
+C7_cases$Case6$NAME
+C7_cases$Case8$NAME
+C7_cases$Case9$NAME
+
+C7_merged <- as.data.frame(read.csv("GSEA/C7/C7_all.tsv", sep = "\t", header = T))
+C7_merged <- C7_merged[C7_merged$NAME %in% c(C7_cases$Case6$NAME,
+                                             C7_cases$Case8$NAME,
+                                             C7_cases$Case9$NAME), ]
+```
+
+
+
